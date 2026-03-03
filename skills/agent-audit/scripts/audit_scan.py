@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""AI Agent/Skill audit scanner.
+
+Scans OpenClaw config, workspace memory, and log files to surface risk info
+around permissions, privacy, token usage, and stability.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import statistics
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+HOME = Path.home()
+CONFIG_PATH = HOME / ".openclaw" / "openclaw.json"
+WORKSPACE = HOME / ".openclaw" / "workspace"
+MEMORY_DIR = WORKSPACE / "memory"
+LOG_DIR = HOME / ".openclaw" / "logs"
+DEFAULT_OUTPUT = WORKSPACE / "audit_report.json"
+
+HIGH_RISK_TOOLS = {
+    "exec",
+    "browser",
+    "message",
+    "nodes",
+    "cron",
+    "canvas",
+    "gateway",
+}
+SENSITIVE_PATTERNS = {
+    "API Key": re.compile(r"sk-[a-zA-Z0-9_-]{20,}", re.IGNORECASE),
+    "Ethereum Key": re.compile(r"0x[a-fA-F0-9]{64}"),
+    "Mnemonic": re.compile(r"(\b[a-z]+\b\s+){11,}\b[a-z]+\b"),
+    "Private Block": re.compile(r"-----BEGIN[\s\w]+PRIVATE KEY-----"),
+}
+TOKEN_PATTERNS = [
+    re.compile(r'"model"\s*:\s*"(?P<model>[^"]+)",.*?"totalTokens"\s*:\s*(?P<tokens>\d+)', re.IGNORECASE),
+    re.compile(r'model=(?P<model>\S+).*?tokens=(?P<tokens>\d+)', re.IGNORECASE),
+]
+
+
+def human_size(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    for unit in ["KB", "MB", "GB"]:
+        num_bytes /= 1024.0
+        if num_bytes < 1024:
+            return f"{num_bytes:.2f} {unit}"
+    return f"{num_bytes:.2f} TB"
+
+
+def load_config() -> Dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        return {}
+    with CONFIG_PATH.open() as f:
+        return json.load(f)
+
+
+def collect_permissions(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    agents = config.get("agents", {})
+    for name, payload in agents.items():
+        tools = list((payload or {}).get("tools", {}).keys())
+        skills = (payload or {}).get("skills")
+        high_risk = [t for t in tools if t in HIGH_RISK_TOOLS]
+        score = min(100, 40 + 15 * len(high_risk)) if high_risk else 10
+        entries.append(
+            {
+                "type": "agent",
+                "name": name,
+                "tools": tools,
+                "highRiskTools": high_risk,
+                "skills": skills,
+                "riskScore": score,
+                "notes": (
+                    ["包含高危工具：" + ", ".join(high_risk)] if high_risk else []
+                ),
+            }
+        )
+
+    skill_cfg = (config.get("skills") or {}).get("entries", {})
+    for name, payload in skill_cfg.items():
+        # Mask secrets but show configured keys
+        masked = {}
+        for key, value in (payload or {}).items():
+            if isinstance(value, str) and len(value) > 8:
+                masked[key] = value[:6] + "…" + value[-4:]
+            else:
+                masked[key] = value
+        entries.append(
+            {
+                "type": "skill",
+                "name": name,
+                "tools": list((payload or {}).keys()),
+                "highRiskTools": [],
+                "skills": None,
+                "riskScore": 20,
+                "notes": ["已配置凭据"] if payload else [],
+                "config": masked,
+            }
+        )
+    return entries
+
+
+@dataclass
+class MemoryIssue:
+    path: str
+    size_bytes: int
+    issues: List[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "path": self.path,
+            "size": human_size(self.size_bytes),
+            "issues": self.issues,
+        }
+
+
+def scan_memory(directory: Path) -> Dict[str, Any]:
+    results: List[MemoryIssue] = []
+    total_size = 0
+    sensitive_hits = 0
+    if not directory.exists():
+        return {
+            "totalSize": 0,
+            "files": [],
+            "sensitiveHits": 0,
+        }
+
+    for path in directory.glob("*.md"):
+        try:
+            content = path.read_text(errors="ignore")
+        except Exception:
+            continue
+        size = path.stat().st_size
+        total_size += size
+        file_issues: List[str] = []
+        for label, pattern in SENSITIVE_PATTERNS.items():
+            matches = pattern.findall(content)
+            if matches:
+                count = len(matches)
+                sensitive_hits += count
+                file_issues.append(f"{label} ×{count}")
+        if size > 1_000_000:
+            file_issues.append("文件超过 1MB，建议归档")
+        if file_issues:
+            results.append(MemoryIssue(str(path), size, file_issues))
+    return {
+        "totalSize": total_size,
+        "files": [item.to_dict() for item in results],
+        "sensitiveHits": sensitive_hits,
+    }
+
+
+def scan_logs(directory: Path) -> Dict[str, Any]:
+    log_entries: List[Dict[str, Any]] = []
+    total_errors = 0
+    total_lines = 0
+    if not directory.exists():
+        return {"files": [], "errorRate": 0.0}
+
+    keywords = ("error", "exception", "traceback", "failed")
+
+    for path in directory.glob("*.log"):
+        errors = 0
+        lines = 0
+        try:
+            with path.open("r", errors="ignore") as fh:
+                for line in fh:
+                    lines += 1
+                    if any(k in line.lower() for k in keywords):
+                        errors += 1
+        except Exception:
+            continue
+        total_errors += errors
+        total_lines += max(lines, 1)
+        log_entries.append(
+            {
+                "path": str(path),
+                "size": human_size(path.stat().st_size),
+                "errors": errors,
+                "lines": lines,
+                "updatedAt": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+            }
+        )
+    rate = total_errors / total_lines if total_lines else 0
+    return {"files": log_entries, "errorRate": rate}
+
+
+def scan_token_usage(directory: Path) -> Dict[str, Any]:
+    totals: Dict[str, int] = {}
+    for path in directory.glob("*.log"):
+        try:
+            with path.open("r", errors="ignore") as fh:
+                for line in fh:
+                    for pattern in TOKEN_PATTERNS:
+                        match = pattern.search(line)
+                        if match:
+                            model = match.group("model")
+                            tokens = int(match.group("tokens"))
+                            totals[model] = totals.get(model, 0) + tokens
+                            break
+        except Exception:
+            continue
+    total_tokens = sum(totals.values())
+    per_model = [
+        {"model": model, "tokens": count}
+        for model, count in sorted(totals.items(), key=lambda item: item[1], reverse=True)
+    ]
+    return {"totalTokens": total_tokens, "byModel": per_model}
+
+
+def score_privacy(sensitive_hits: int) -> int:
+    if sensitive_hits == 0:
+        return 5
+    return min(100, 30 + sensitive_hits * 15)
+
+
+def score_privilege(permissions: List[Dict[str, Any]]) -> int:
+    high = sum(len(entry.get("highRiskTools", [])) for entry in permissions if entry["type"] == "agent")
+    return min(100, 20 + high * 20) if high else 15
+
+
+def score_memory(total_size: int) -> int:
+    mb = total_size / 1_000_000
+    if mb <= 2:
+        return 10
+    if mb <= 5:
+        return 40
+    return min(100, 40 + int((mb - 5) * 10))
+
+
+def score_tokens(total_tokens: int) -> int:
+    if total_tokens == 0:
+        return 10
+    if total_tokens <= 500_000:
+        return 35
+    return min(100, 35 + int((total_tokens - 500_000) / 50_000))
+
+
+def score_failures(error_rate: float) -> int:
+    return min(100, int(error_rate * 400))
+
+
+def build_suggestions(report: Dict[str, Any]) -> List[str]:
+    suggestions: List[str] = []
+    if report["privacyRisk"] > 30:
+        suggestions.append("在 memory/ 中查找敏感信息并进行脱敏或迁移到安全存储。")
+    if report["privilegeRisk"] > 30:
+        suggestions.append("为含 exec/browser 的 Agent 添加操作确认或拆分角色。")
+    if report["memoryRisk"] > 40:
+        suggestions.append("定期归档 memory 文件（>1MB）并替换为摘要。")
+    if report["tokenRisk"] > 35:
+        suggestions.append("为高消耗模型设置预算守卫或改用低成本模型。")
+    if report["failureRisk"] > 25:
+        suggestions.append("检查日志中高频错误，增加重试/超时保护。")
+    return suggestions
+
+
+def generate_report() -> Dict[str, Any]:
+    config = load_config()
+    permissions = collect_permissions(config)
+    memory_info = scan_memory(MEMORY_DIR)
+    log_info = scan_logs(LOG_DIR)
+    token_info = scan_token_usage(LOG_DIR)
+
+    report = {
+        "generatedAt": datetime.utcnow().isoformat() + "Z",
+        "permissions": permissions,
+        "memory": memory_info,
+        "logs": log_info,
+        "tokens": token_info,
+    }
+    report["privacyRisk"] = score_privacy(memory_info.get("sensitiveHits", 0))
+    report["privilegeRisk"] = score_privilege(permissions)
+    report["memoryRisk"] = score_memory(memory_info.get("totalSize", 0))
+    report["tokenRisk"] = score_tokens(token_info.get("totalTokens", 0))
+    report["failureRisk"] = score_failures(log_info.get("errorRate", 0.0))
+    report["suggestions"] = build_suggestions(report)
+    return report
+
+
+def save_report(report: Dict[str, Any], output: Path) -> None:
+    output.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def to_markdown(report: Dict[str, Any]) -> str:
+    lines = [
+        f"# AI Agent 体检报告",
+        f"生成时间：{report['generatedAt']}",
+        "",
+        "## 风险评分",
+        f"- 隐私泄露：{report['privacyRisk']}",
+        f"- 越权风险：{report['privilegeRisk']}",
+        f"- 记忆膨胀：{report['memoryRisk']}",
+        f"- Token 成本：{report['tokenRisk']}",
+        f"- 失败率：{report['failureRisk']}",
+        "",
+        "## 修复建议",
+    ]
+    if report.get("suggestions"):
+        for item in report["suggestions"]:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- 暂无高风险项。")
+
+    lines.extend([
+        "",
+        "## 权限概览",
+        "| 类型 | 名称 | 工具 | 高危 | 备注 |",
+        "| --- | --- | --- | --- | --- |",
+    ])
+    for entry in report["permissions"]:
+        lines.append(
+            f"| {entry['type']} | {entry['name']} | {', '.join(entry['tools']) or '-'} | {', '.join(entry.get('highRiskTools', [])) or '-'} | {'; '.join(entry.get('notes', [])) or '-'} |"
+        )
+
+    lines.extend([
+        "",
+        "## 记忆问题",
+        "| 文件 | 大小 | 问题 |",
+        "| --- | --- | --- |",
+    ])
+    if report["memory"]["files"]:
+        for item in report["memory"]["files"]:
+            lines.append(f"| {item['path']} | {item['size']} | {', '.join(item['issues'])} |")
+    else:
+        lines.append("| - | - | - |")
+
+    lines.extend([
+        "",
+        "## Token 使用",
+        "| 模型 | Tokens |",
+        "| --- | --- |",
+    ])
+    if report["tokens"]["byModel"]:
+        for item in report["tokens"]["byModel"]:
+            lines.append(f"| {item['model']} | {item['tokens']} |")
+    else:
+        lines.append("| - | - |")
+
+    lines.extend([
+        "",
+        "## 日志摘要",
+        "| 文件 | 大小 | 错误 | 行数 | 更新时间 |",
+        "| --- | --- | --- | --- | --- |",
+    ])
+    if report["logs"]["files"]:
+        for item in report["logs"]["files"]:
+            lines.append(
+                f"| {item['path']} | {item['size']} | {item['errors']} | {item['lines']} | {item['updatedAt']} |"
+            )
+    else:
+        lines.append("| - | - | - | - | - |")
+
+    return "\n".join(lines)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Scan OpenClaw workspace for agent/skill risks.")
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="输出 JSON 报告路径")
+    parser.add_argument("--markdown", type=Path, help="可选 Markdown 报告路径")
+    args = parser.parse_args()
+
+    report = generate_report()
+    save_report(report, args.output)
+    if args.markdown:
+        args.markdown.write_text(to_markdown(report))
+    print(f"✅ 体检完成：JSON -> {args.output}")
+    if args.markdown:
+        print(f"✅ Markdown -> {args.markdown}")
+
+
+if __name__ == "__main__":
+    main()
