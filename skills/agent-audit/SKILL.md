@@ -50,7 +50,7 @@ description: Run the Agent Audit health-check for OpenClaw workspaces—scan age
 
 ## 风险指标速查
 - **隐私泄露**：memory/日志中命中的 API Key、私钥、助记词次数；≥60 说明有高危泄漏，先清理再复检。
-- **越权风险**：agent 是否有 `exec`、`browser`、`cron`、`message`、`nodes`、`canvas` 等工具；≥60 要求拆分或加双重确认。
+- **越权风险**：agent 是否有 `exec`、`browser`、`cron`、`message`、`nodes`、`canvas`、`gateway` 等高危工具；≥60 要求拆分或加双重确认。
 - **记忆膨胀**：`memory/` 总体积；超过 5MB 即进入黄色/红色区。
 - **Token 成本**：最近日志解析到的 tokenUsage 汇总；若日志未记录则为 0。
 - **失败率**：日志中包含 error/traceback/failed 的行占比，提示是否需要重试/修复脚本。

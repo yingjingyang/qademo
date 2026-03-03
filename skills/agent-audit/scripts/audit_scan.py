@@ -11,11 +11,12 @@ import argparse
 import json
 import os
 import re
-import statistics
-from dataclasses import dataclass, asdict
+import sys
+import tempfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 HOME = Path.home()
 CONFIG_PATH = HOME / ".openclaw" / "openclaw.json"
@@ -36,13 +37,17 @@ HIGH_RISK_TOOLS = {
 SENSITIVE_PATTERNS = {
     "API Key": re.compile(r"sk-[a-zA-Z0-9_-]{20,}", re.IGNORECASE),
     "Ethereum Key": re.compile(r"0x[a-fA-F0-9]{64}"),
-    "Mnemonic": re.compile(r"(\b[a-z]+\b\s+){11,}\b[a-z]+\b"),
+    "Mnemonic": re.compile(r"\b(?:[a-z]{3,10}\s+){11,23}[a-z]{3,10}\b", re.IGNORECASE),
     "Private Block": re.compile(r"-----BEGIN[\s\w]+PRIVATE KEY-----"),
+    "AWS Access Key": re.compile(r"AKIA[0-9A-Z]{16}"),
+    "JWT": re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
+    "Database URL": re.compile(r"(postgres|mysql|mongodb|redis|mssql)://[^\s]+", re.IGNORECASE),
 }
 TOKEN_PATTERNS = [
-    re.compile(r'"model"\s*:\s*"(?P<model>[^"]+)",.*?"totalTokens"\s*:\s*(?P<tokens>\d+)', re.IGNORECASE),
-    re.compile(r'model=(?P<model>\S+).*?tokens=(?P<tokens>\d+)', re.IGNORECASE),
+    re.compile(r'"model"\s*:\s*"(?P<model>[^"]+)".*?"totalTokens"\s*:\s*(?P<tokens>\d+)', re.IGNORECASE | re.DOTALL),
+    re.compile(r'model=(?P<model>\S+).*?(?:tokens|totalTokens)=(?P<tokens>\d+)', re.IGNORECASE),
 ]
+MNEMONIC_KEYWORDS = ("mnemonic", "seed phrase", "seed", "助记词")
 
 
 def human_size(num_bytes: int) -> str:
@@ -55,21 +60,69 @@ def human_size(num_bytes: int) -> str:
     return f"{num_bytes:.2f} TB"
 
 
+def _warn_perms(path: Path) -> None:
+    try:
+        stat_info = path.stat()
+    except OSError:
+        return
+    if stat_info.st_mode & 0o077:
+        print(f"⚠️  警告：{path} 权限过宽 (建议 600)", file=sys.stderr)
+
+
 def load_config() -> Dict[str, Any]:
     if not CONFIG_PATH.exists():
         return {}
+    _warn_perms(CONFIG_PATH)
     with CONFIG_PATH.open() as f:
         return json.load(f)
+
+
+def _normalize_tools(value: Any) -> List[str]:
+    if isinstance(value, dict):
+        return list(value.keys())
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+def _mask_value(value: Any) -> str:
+    serialized = str(value)
+    if len(serialized) <= 4:
+        return "***"
+    return f"{serialized[:2]}***{serialized[-2:]}"
+
+
+def _assess_skill_risk(name: str, payload: Dict[str, Any]) -> Tuple[int, List[str]]:
+    base = 15
+    notes: List[str] = []
+    sensitive_keys = ("key", "secret", "token", "password", "dsn", "api", "private")
+    for key, value in payload.items():
+        lower_key = key.lower()
+        if any(flag in lower_key for flag in sensitive_keys):
+            base += 10
+            notes.append(f"包含敏感配置: {key}")
+        if isinstance(value, str):
+            for label, pattern in SENSITIVE_PATTERNS.items():
+                if label == "Mnemonic":
+                    continue
+                if pattern.search(value):
+                    base += 5
+                    notes.append(f"{key} 匹配 {label}")
+                    break
+    return min(100, base), notes
 
 
 def collect_permissions(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     entries: List[Dict[str, Any]] = []
     agents = config.get("agents", {})
     for name, payload in agents.items():
-        tools = list((payload or {}).get("tools", {}).keys())
-        skills = (payload or {}).get("skills")
-        high_risk = [t for t in tools if t in HIGH_RISK_TOOLS]
-        score = min(100, 40 + 15 * len(high_risk)) if high_risk else 10
+        payload = payload or {}
+        tools = _normalize_tools(payload.get("tools", {}))
+        skills = payload.get("skills") or []
+        high_risk = [tool for tool in tools if tool in HIGH_RISK_TOOLS]
+        score = min(100, 15 + 20 * len(high_risk)) if high_risk else 15
         entries.append(
             {
                 "type": "agent",
@@ -78,30 +131,25 @@ def collect_permissions(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "highRiskTools": high_risk,
                 "skills": skills,
                 "riskScore": score,
-                "notes": (
-                    ["包含高危工具：" + ", ".join(high_risk)] if high_risk else []
-                ),
+                "notes": (["包含高危工具：" + ", ".join(high_risk)] if high_risk else []),
             }
         )
 
     skill_cfg = (config.get("skills") or {}).get("entries", {})
     for name, payload in skill_cfg.items():
-        # Mask secrets but show configured keys
-        masked = {}
-        for key, value in (payload or {}).items():
-            if isinstance(value, str) and len(value) > 8:
-                masked[key] = value[:6] + "…" + value[-4:]
-            else:
-                masked[key] = value
+        payload = payload or {}
+        masked = {key: _mask_value(value) for key, value in payload.items()}
+        risk_score, risk_notes = _assess_skill_risk(name, payload)
         entries.append(
             {
                 "type": "skill",
                 "name": name,
-                "tools": list((payload or {}).keys()),
+                "tools": _normalize_tools(payload.get("tools", [])),
                 "highRiskTools": [],
                 "skills": None,
-                "riskScore": 20,
-                "notes": ["已配置凭据"] if payload else [],
+                "riskScore": risk_score,
+                "notes": (["已配置凭据"] if payload else []) + risk_notes,
+                "configKeys": list(payload.keys()),
                 "config": masked,
             }
         )
@@ -122,30 +170,69 @@ class MemoryIssue:
         }
 
 
+def _is_within(base: Path, target: Path) -> bool:
+    try:
+        target.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
 def scan_memory(directory: Path) -> Dict[str, Any]:
     results: List[MemoryIssue] = []
     total_size = 0
     sensitive_hits = 0
     if not directory.exists():
-        return {
-            "totalSize": 0,
-            "files": [],
-            "sensitiveHits": 0,
-        }
+        return {"totalSize": 0, "files": [], "sensitiveHits": 0}
 
+    base_dir = directory.resolve()
     for path in directory.glob("*.md"):
         try:
-            content = path.read_text(errors="ignore")
-        except Exception:
+            resolved = path.resolve()
+        except OSError:
             continue
-        size = path.stat().st_size
+        if path.is_symlink() or not _is_within(base_dir, resolved):
+            continue
+        try:
+            stat_info = path.stat()
+        except OSError:
+            continue
+        size = stat_info.st_size
         total_size += size
         file_issues: List[str] = []
-        for label, pattern in SENSITIVE_PATTERNS.items():
-            matches = pattern.findall(content)
+        counts = {label: 0 for label in SENSITIVE_PATTERNS}
+        mnemonic_snippets: List[str] = []
+        capture_ttl = 0
+        try:
+            with path.open("r", errors="ignore") as fh:
+                for line in fh:
+                    lowered = line.lower()
+                    if any(keyword in lowered for keyword in MNEMONIC_KEYWORDS):
+                        capture_ttl = 4
+                        mnemonic_snippets.append(line)
+                    elif capture_ttl > 0:
+                        mnemonic_snippets.append(line)
+                        capture_ttl -= 1
+                    for label, pattern in SENSITIVE_PATTERNS.items():
+                        if label == "Mnemonic":
+                            continue
+                        matches = pattern.findall(line)
+                        if matches:
+                            count = len(matches)
+                            counts[label] += count
+                            sensitive_hits += count
+        except Exception:
+            continue
+
+        if mnemonic_snippets:
+            snippet_text = " ".join(mnemonic_snippets)
+            matches = SENSITIVE_PATTERNS["Mnemonic"].findall(snippet_text)
             if matches:
-                count = len(matches)
-                sensitive_hits += count
+                counts["Mnemonic"] += len(matches)
+                sensitive_hits += len(matches)
+
+        for label, count in counts.items():
+            if count:
                 file_issues.append(f"{label} ×{count}")
         if size > 1_000_000:
             file_issues.append("文件超过 1MB，建议归档")
@@ -158,62 +245,60 @@ def scan_memory(directory: Path) -> Dict[str, Any]:
     }
 
 
-def scan_logs(directory: Path) -> Dict[str, Any]:
+def scan_logs_and_tokens(directory: Path) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     log_entries: List[Dict[str, Any]] = []
     total_errors = 0
     total_lines = 0
+    token_totals: Dict[str, int] = {}
     if not directory.exists():
-        return {"files": [], "errorRate": 0.0}
+        return (
+            {"files": [], "errorRate": 0.0, "dataAvailable": False},
+            {"totalTokens": 0, "byModel": [], "dataAvailable": False},
+        )
 
     keywords = ("error", "exception", "traceback", "failed")
-
     for path in directory.glob("*.log"):
         errors = 0
         lines = 0
         try:
+            stat_info = path.stat()
             with path.open("r", errors="ignore") as fh:
                 for line in fh:
                     lines += 1
-                    if any(k in line.lower() for k in keywords):
+                    lower = line.lower()
+                    if any(k in lower for k in keywords):
                         errors += 1
+                    if "model" in lower:
+                        for pattern in TOKEN_PATTERNS:
+                            match = pattern.search(line)
+                            if match:
+                                model = match.group("model")
+                                tokens = int(match.group("tokens"))
+                                token_totals[model] = token_totals.get(model, 0) + tokens
+                                break
         except Exception:
             continue
         total_errors += errors
-        total_lines += max(lines, 1)
+        total_lines += lines
         log_entries.append(
             {
                 "path": str(path),
-                "size": human_size(path.stat().st_size),
+                "size": human_size(stat_info.st_size),
                 "errors": errors,
                 "lines": lines,
-                "updatedAt": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+                "updatedAt": datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
             }
         )
-    rate = total_errors / total_lines if total_lines else 0
-    return {"files": log_entries, "errorRate": rate}
-
-
-def scan_token_usage(directory: Path) -> Dict[str, Any]:
-    totals: Dict[str, int] = {}
-    for path in directory.glob("*.log"):
-        try:
-            with path.open("r", errors="ignore") as fh:
-                for line in fh:
-                    for pattern in TOKEN_PATTERNS:
-                        match = pattern.search(line)
-                        if match:
-                            model = match.group("model")
-                            tokens = int(match.group("tokens"))
-                            totals[model] = totals.get(model, 0) + tokens
-                            break
-        except Exception:
-            continue
-    total_tokens = sum(totals.values())
+    rate = total_errors / total_lines if total_lines else 0.0
+    total_tokens = sum(token_totals.values())
     per_model = [
         {"model": model, "tokens": count}
-        for model, count in sorted(totals.items(), key=lambda item: item[1], reverse=True)
+        for model, count in sorted(token_totals.items(), key=lambda item: item[1], reverse=True)
     ]
-    return {"totalTokens": total_tokens, "byModel": per_model}
+    return (
+        {"files": log_entries, "errorRate": rate, "dataAvailable": True},
+        {"totalTokens": total_tokens, "byModel": per_model, "dataAvailable": True},
+    )
 
 
 def score_privacy(sensitive_hits: int) -> int:
@@ -224,7 +309,7 @@ def score_privacy(sensitive_hits: int) -> int:
 
 def score_privilege(permissions: List[Dict[str, Any]]) -> int:
     high = sum(len(entry.get("highRiskTools", [])) for entry in permissions if entry["type"] == "agent")
-    return min(100, 20 + high * 20) if high else 15
+    return min(100, 15 + high * 20) if high else 15
 
 
 def score_memory(total_size: int) -> int:
@@ -267,8 +352,7 @@ def generate_report() -> Dict[str, Any]:
     config = load_config()
     permissions = collect_permissions(config)
     memory_info = scan_memory(MEMORY_DIR)
-    log_info = scan_logs(LOG_DIR)
-    token_info = scan_token_usage(LOG_DIR)
+    log_info, token_info = scan_logs_and_tokens(LOG_DIR)
 
     report = {
         "generatedAt": datetime.utcnow().isoformat() + "Z",
@@ -286,13 +370,23 @@ def generate_report() -> Dict[str, Any]:
     return report
 
 
+def _secure_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=str(path.parent), delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = Path(tmp.name)
+    os.replace(tmp_path, path)
+    os.chmod(path, 0o600)
+
+
 def save_report(report: Dict[str, Any], output: Path) -> None:
-    output.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    payload = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+    _secure_write(output, payload)
 
 
 def to_markdown(report: Dict[str, Any]) -> str:
     lines = [
-        f"# AI Agent 体检报告",
+        "# AI Agent 体检报告",
         f"生成时间：{report['generatedAt']}",
         "",
         "## 风险评分",
@@ -318,7 +412,7 @@ def to_markdown(report: Dict[str, Any]) -> str:
     ])
     for entry in report["permissions"]:
         lines.append(
-            f"| {entry['type']} | {entry['name']} | {', '.join(entry['tools']) or '-'} | {', '.join(entry.get('highRiskTools', [])) or '-'} | {'; '.join(entry.get('notes', [])) or '-'} |"
+            f"| {entry['type']} | {entry['name']} | {', '.join(entry.get('tools', [])) or '-'} | {', '.join(entry.get('highRiskTools', [])) or '-'} | {'; '.join(entry.get('notes', [])) or '-'} |"
         )
 
     lines.extend([
@@ -371,10 +465,10 @@ def main() -> None:
     report = generate_report()
     save_report(report, args.output)
     if args.markdown:
-        args.markdown.write_text(to_markdown(report))
-    print(f"✅ 体检完成：JSON -> {args.output}")
+        _secure_write(args.markdown, to_markdown(report))
+    print(f"✅ 体检完成：JSON -> {args.output.name}")
     if args.markdown:
-        print(f"✅ Markdown -> {args.markdown}")
+        print(f"✅ Markdown -> {args.markdown.name}")
 
 
 if __name__ == "__main__":

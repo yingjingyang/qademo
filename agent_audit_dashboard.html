@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Agent 体检面板</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f1117;
+      --card: #1a1d2b;
+      --border: #272b3f;
+      --accent: #7b5bff;
+      --text: #f7f8ff;
+      --muted: #9aa0c2;
+      font-family: "Inter", "HarmonyOS Sans", "SF Pro", sans-serif;
+    }
+
+    body {
+      margin: 0;
+      padding: 32px;
+      background: radial-gradient(circle at top, rgba(123, 91, 255, 0.25), transparent 45%), var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+    }
+
+    .page {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+
+    .header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+
+    .pill {
+      padding: 4px 10px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 999px;
+      font-size: 14px;
+      color: var(--muted);
+    }
+
+    button {
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: 999px;
+      padding: 10px 20px;
+      font-size: 15px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      box-shadow: 0 12px 30px rgba(123, 91, 255, 0.35);
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      box-shadow: none;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 25px 45px rgba(0, 0, 0, 0.35);
+    }
+
+    .card h2 {
+      margin: 0 0 8px;
+      font-size: 16px;
+      color: var(--muted);
+    }
+
+    .risk-value {
+      font-size: 32px;
+      font-weight: 600;
+    }
+
+    .risk-desc {
+      font-size: 14px;
+      color: var(--muted);
+    }
+
+    .risk-meta {
+      margin-top: 6px;
+      font-size: 13px;
+      color: var(--muted);
+      font-weight: 500;
+    }
+
+    .flex {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .flex .card {
+      flex: 1 1 280px;
+    }
+
+    .legend-card ul {
+      list-style: none;
+      padding: 0;
+      margin: 12px 0 0;
+      display: grid;
+      gap: 6px;
+    }
+
+    .legend-card li {
+      font-size: 14px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+      color: var(--muted);
+    }
+
+    th, td {
+      padding: 10px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    th {
+      text-align: left;
+      color: var(--text);
+      font-weight: 500;
+    }
+
+    .badge {
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+    }
+
+    .suggestion {
+      background: rgba(123, 91, 255, 0.08);
+      border-left: 3px solid var(--accent);
+      padding: 12px;
+      border-radius: 12px;
+      margin-bottom: 12px;
+    }
+
+    .updated {
+      font-size: 13px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div>
+        <div class="pill">AI 体检 · Agent / Skill 安全 Dashboard</div>
+        <h1>一键扫描权限、日志、记忆与成本</h1>
+        <p class="updated" id="last-run">尚未运行体检</p>
+      </div>
+      <button id="scanBtn">
+        <span id="scanLabel">⚡️ 一键体检</span>
+      </button>
+    </div>
+
+    <div class="summary-grid" id="riskSummary">
+      <!-- 风险卡片动态渲染 -->
+    </div>
+
+    <div class="card legend-card">
+      <h2>评分标准</h2>
+      <ul>
+        <li><span class="dot" style="background:#36d399"></span>0 – 29：安全 · 常规巡检即可</li>
+        <li><span class="dot" style="background:#ffb347"></span>30 – 59：关注 · 需要排期处理</li>
+        <li><span class="dot" style="background:#ff6b6b"></span>≥ 60：高风险 · 建议立即修复</li>
+      </ul>
+      <p class="risk-desc">分数越高代表风险越大，颜色与上方卡片一致。</p>
+    </div>
+
+    <div class="flex">
+      <div class="card">
+        <h2>权限概览</h2>
+        <table id="permissionTable"></table>
+      </div>
+      <div class="card">
+        <h2>日志 & 记忆</h2>
+        <table id="memoryTable"></table>
+      </div>
+    </div>
+
+    <div class="flex" style="margin-top: 18px;">
+      <div class="card">
+        <h2>Token 消耗（近 7 天）</h2>
+        <table id="tokenTable"></table>
+      </div>
+      <div class="card">
+        <h2>修复建议</h2>
+        <div id="suggestions"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const riskSummaryEl = document.getElementById('riskSummary');
+    const permissionTable = document.getElementById('permissionTable');
+    const memoryTable = document.getElementById('memoryTable');
+    const tokenTable = document.getElementById('tokenTable');
+    const suggestionsEl = document.getElementById('suggestions');
+    const lastRunEl = document.getElementById('last-run');
+    const scanBtn = document.getElementById('scanBtn');
+    const scanLabel = document.getElementById('scanLabel');
+
+    const riskColors = score => {
+      if (score >= 70) return '#ff6b6b';
+      if (score >= 40) return '#ffb347';
+      return '#36d399';
+    };
+
+    const riskLevelInfo = score => {
+      if (score >= 60) return { label: '高风险', range: '≥60', color: '#ff6b6b' };
+      if (score >= 30) return { label: '需关注', range: '30-59', color: '#ffb347' };
+      return { label: '安全', range: '0-29', color: '#36d399' };
+    };
+
+    const formatMB = bytes => (bytes / 1_000_000).toFixed(3);
+
+    function renderReport(report) {
+      const summary = [
+        { label: '隐私泄露', score: report.privacyRisk ?? 0, desc: `敏感命中 ${report.memory?.sensitiveHits ?? 0} 次` },
+        { label: '越权风险', score: report.privilegeRisk ?? 0, desc: `${report.permissions?.filter(p => (p.highRiskTools || []).length).length || 0} 个 Agent 拥有高危工具` },
+        { label: '记忆膨胀', score: report.memoryRisk ?? 0, desc: `总量 ${formatMB(report.memory?.totalSize ?? 0)} MB` },
+        { label: 'Token 成本', score: report.tokenRisk ?? 0, desc: `累计 ${report.tokens?.totalTokens ?? 0} tokens` },
+        { label: '失败率', score: report.failureRisk ?? 0, desc: `日志错误率 ${((report.logs?.errorRate ?? 0) * 100).toFixed(2)}%` }
+      ];
+
+      riskSummaryEl.innerHTML = summary.map(({ label, score, desc }) => {
+        const meta = riskLevelInfo(score);
+        return `
+        <div class="card">
+          <h2>${label}</h2>
+          <div class="risk-value" style="color:${riskColors(score)};">${score}</div>
+          <div class="risk-desc">${desc}</div>
+          <div class="risk-meta" style="color:${meta.color};">${meta.label} · ${meta.range}</div>
+        </div>`;
+      }).join('');
+
+      const permissions = report.permissions || [];
+      permissionTable.innerHTML = `
+        <tr><th>Agent / Skill</th><th>工具权限</th><th>高危</th><th>备注</th></tr>
+        ${permissions.map(p => `
+          <tr>
+            <td>${p.name}</td>
+            <td>${(p.tools || []).join(', ') || '-'}</td>
+            <td><span class="badge">${(p.highRiskTools || []).join(', ') || '-'}</span></td>
+            <td>${(p.notes || []).join('；') || '-'}</td>
+          </tr>`).join('')}
+      `;
+
+      const memoryFiles = report.memory?.files || [];
+      memoryTable.innerHTML = `
+        <tr><th>文件</th><th>大小</th><th>问题</th></tr>
+        ${memoryFiles.length ? memoryFiles.map(row => `
+          <tr>
+            <td>${row.path}</td>
+            <td>${row.size}</td>
+            <td>${(row.issues || []).join('；')}</td>
+          </tr>`).join('') : '<tr><td colspan="3">暂无异常</td></tr>'}
+      `;
+
+      const tokenRows = (report.tokens?.byModel || []).map(row => ({
+        model: row.model,
+        usage: row.tokens.toLocaleString(),
+      }));
+      tokenTable.innerHTML = `
+        <tr><th>模型 / Skill</th><th>Tokens</th></tr>
+        ${tokenRows.length ? tokenRows.map(row => `
+          <tr>
+            <td>${row.model}</td>
+            <td>${row.usage}</td>
+          </tr>`).join('') : '<tr><td colspan="2">没有捕获到 token 数据</td></tr>'}
+      `;
+
+      const suggestions = report.suggestions?.length ? report.suggestions : ['暂无建议'];
+      suggestionsEl.innerHTML = suggestions.map(text => `
+        <div class="suggestion">${text}</div>
+      `).join('');
+    }
+
+    async function runAudit() {
+      scanBtn.disabled = true;
+      scanLabel.textContent = '扫描中…';
+      lastRunEl.textContent = '正在扫描…（请先运行 audit_scan.py 生成最新数据）';
+
+      try {
+        const resp = await fetch(`audit_report.json?ts=${Date.now()}`);
+        if (!resp.ok) {
+            throw new Error('无法获取报告文件');
+        }
+        const data = await resp.json();
+        renderReport(data);
+        const ts = new Date().toLocaleString('zh-CN', { hour12: false });
+        lastRunEl.textContent = `最近体检：${ts}`;
+      } catch (err) {
+        suggestionsEl.innerHTML = `<div class="suggestion">${err.message}。请先运行 python3 audit_scan.py。</div>`;
+        riskSummaryEl.innerHTML = '';
+      } finally {
+        scanBtn.disabled = false;
+        scanLabel.textContent = '⚡️ 再次体检';
+      }
+    }
+
+    scanBtn.addEventListener('click', runAudit);
+
+    // 初始渲染
+    suggestionsEl.innerHTML = '<div class="suggestion">点击「一键体检」开始扫描。</div>';
+  </script>
+</body>
+</html>
