@@ -149,17 +149,21 @@ def _load_skill_text_from_path(raw_path: str) -> Tuple[str, str]:
     return candidate.stem, text
 
 
-def _load_skill_text_from_url(url: str) -> Tuple[str, str]:
+def _fetch_text_from_url(url: str) -> str:
     try:
         context = ssl.create_default_context()
         with urlopen(url, context=context) as resp:  # nosec - 用户指定 URL
             charset = resp.headers.get_content_charset() or "utf-8"
-            text = resp.read().decode(charset, errors="ignore")
+            return resp.read().decode(charset, errors="ignore")
     except Exception:
         proc = subprocess.run(["curl", "-fsSL", url], capture_output=True, text=True)
         if proc.returncode != 0:
             raise URLError(proc.stderr.strip() or "无法通过 curl 获取内容")
-        text = proc.stdout
+        return proc.stdout
+
+
+def _load_skill_text_from_url(url: str) -> Tuple[str, str]:
+    text = _fetch_text_from_url(url)
     name = Path(urlparse(url).path).stem or url
     return name, text
 
@@ -220,6 +224,87 @@ def load_external_skills(path_inputs: Optional[List[str]], url_inputs: Optional[
             entries.append(_analyze_external_skill(name_hint, text, url))
         except (URLError, OSError) as exc:
             print(f"⚠️ 无法获取远程 skill {url}: {exc}", file=sys.stderr)
+    return entries
+
+
+def _load_agent_json_from_path(raw_path: str) -> Tuple[str, Any]:
+    path = Path(raw_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"未找到 agent JSON：{path}")
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    data = json.loads(text)
+    return path.stem, data
+
+
+def _load_agent_json_from_url(url: str) -> Tuple[str, Any]:
+    text = _fetch_text_from_url(url)
+    data = json.loads(text)
+    name = Path(urlparse(url).path).stem or url
+    return name, data
+
+
+def _normalize_agent_entries(blob: Any) -> List[Tuple[str, Dict[str, Any]]]:
+    entries: List[Tuple[str, Dict[str, Any]]] = []
+    if isinstance(blob, dict):
+        agents_section = blob.get("agents")
+        if isinstance(agents_section, dict):
+            for name, payload in agents_section.items():
+                entries.append((str(name), payload or {}))
+        else:
+            name = str(blob.get("name") or blob.get("agent") or "external-agent")
+            entries.append((name, blob))
+    return entries
+
+
+def _analyze_external_agent(name: str, payload: Dict[str, Any], origin: str) -> Dict[str, Any]:
+    payload = payload or {}
+    tools = _normalize_tools(payload.get("tools", {}))
+    skills = payload.get("skills") or []
+    high_risk = [tool for tool in tools if tool in HIGH_RISK_TOOLS]
+    score = min(100, 15 + 20 * len(high_risk)) if high_risk else 15
+    notes = [f"未安装 agent · 来源：{origin}"]
+    if skills:
+        notes.append("可调用 skills：" + ", ".join(skills))
+    description = payload.get("description")
+    if description:
+        notes.append(str(description))
+    if high_risk:
+        notes.append("包含高危工具：" + ", ".join(high_risk))
+    return {
+        "type": "agent",
+        "name": name,
+        "tools": tools,
+        "highRiskTools": high_risk,
+        "skills": skills,
+        "riskScore": score,
+        "notes": notes,
+    }
+
+
+def load_external_agents(path_inputs: Optional[List[str]], url_inputs: Optional[List[str]]) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+
+    def _extend(blob: Any, origin: str) -> None:
+        for name, payload in _normalize_agent_entries(blob):
+            entries.append(_analyze_external_agent(name, payload, origin))
+
+    for raw in path_inputs or []:
+        if not raw:
+            continue
+        try:
+            _, data = _load_agent_json_from_path(raw)
+            origin = str(Path(raw).expanduser())
+            _extend(data, origin)
+        except Exception as exc:
+            print(f"⚠️ 无法读取本地 agent {raw}: {exc}", file=sys.stderr)
+    for url in url_inputs or []:
+        if not url:
+            continue
+        try:
+            _, data = _load_agent_json_from_url(url)
+            _extend(data, url)
+        except (URLError, OSError, json.JSONDecodeError) as exc:
+            print(f"⚠️ 无法获取远程 agent {url}: {exc}", file=sys.stderr)
     return entries
 
 
@@ -635,12 +720,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Scan OpenClaw workspace for agent/skill risks.")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="输出 JSON 报告路径")
     parser.add_argument("--markdown", type=Path, help="可选 Markdown 报告路径")
-    parser.add_argument("--skill-path", action="append", default=[], help="未安装 skill/agent 的本地路径 (文件或目录)")
-    parser.add_argument("--skill-url", action="append", default=[], help="未安装 skill/agent 的远程 URL")
+    parser.add_argument("--skill-path", action="append", default=[], help="未安装 skill 的本地路径 (文件或目录)")
+    parser.add_argument("--skill-url", action="append", default=[], help="未安装 skill 的远程 URL")
+    parser.add_argument("--agent-path", action="append", default=[], help="未安装 agent 的 JSON 文件或 openclaw.json 片段")
+    parser.add_argument("--agent-url", action="append", default=[], help="未安装 agent 的远程 JSON URL")
     args = parser.parse_args()
 
-    extra_entries = load_external_skills(args.skill_path, args.skill_url)
-    report = generate_report(extra_entries)
+    extra_skills = load_external_skills(args.skill_path, args.skill_url)
+    extra_agents = load_external_agents(args.agent_path, args.agent_url)
+    combined = (extra_skills or []) + (extra_agents or [])
+    report = generate_report(combined)
     save_report(report, args.output)
     if args.markdown:
         _secure_write(args.markdown, to_markdown(report))
